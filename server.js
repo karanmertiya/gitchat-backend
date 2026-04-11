@@ -3,50 +3,37 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import Groq from 'groq-sdk';
 
 dotenv.config();
 
 const app = express();
 app.use(cors({
-  origin: '*', 
+  origin: '*',
   methods: ['GET', 'POST', 'PATCH', 'DELETE'],
   allowedHeaders: ['Content-Type']
 }));
 app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+
+// Primary Engine: Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+// Backup Engine: Groq (The speed demon with the crazy free tier)
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // 1. Initialize
 app.post('/init', async (req, res) => {
     try {
         const { user_id, workspace_name } = req.body;
-        const { data: workspace, error: wsError } = await supabase
-            .from('workspaces')
-            .insert([{ name: workspace_name, created_by: user_id }])
-            .select()
-            .single();
-
-        if (wsError) {
-            console.error("Supabase Workspace Error:", wsError); // This shows in Render Logs
-            return res.status(500).json({ error: wsError.message, details: wsError.details }); // This shows in Browser
-        }
-
-        const { data: branch, error: brError } = await supabase
-            .from('branches')
-            .insert([{ workspace_id: workspace.id, name: 'main' }])
-            .select()
-            .single();
-
-        if (brError) {
-            console.error("Supabase Branch Error:", brError);
-            return res.status(500).json({ error: brError.message });
-        }
-
+        const { data: workspace, error: wsError } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
+        if (wsError) throw wsError;
+        const { data: branch, error: brError } = await supabase.from('branches').insert([{ workspace_id: workspace.id, name: 'main' }]).select().single();
+        if (brError) throw brError;
         res.json({ success: true, workspace, branch });
     } catch (error) {
-        console.error("Global Server Error:", error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -80,12 +67,11 @@ app.patch('/branch/toggle', async (req, res) => {
     }
 });
 
-// 4. Merge Branch (The AI Auto-Summary)
+// 4. Merge Branch (With Groq Fallback)
 app.post('/merge', async (req, res) => {
     try {
         const { source_branch_id, target_branch_id, latest_message_id_in_source, parent_message_id_in_target } = req.body;
 
-        // Step A: Read the source branch history
         let historyText = "";
         let currentId = latest_message_id_in_source;
         while (currentId) {
@@ -95,12 +81,23 @@ app.post('/merge', async (req, res) => {
             currentId = msg.parent_message_id;
         }
 
-        // Step B: Ask AI to summarize the tangent
         const mergePrompt = `You are a Git-Merge agent for an AI chat app. Read the following conversational tangent and write a concise, 2-sentence summary of the final conclusion or decision made. \n\nTangent History:\n${historyText}`;
-        const result = await model.generateContent(mergePrompt);
-        const mergeSummary = result.response.text();
+        
+        let mergeSummary = "";
+        try {
+            // Attempt 1: Gemini
+            const result = await model.generateContent(mergePrompt);
+            mergeSummary = result.response.text();
+        } catch (geminiError) {
+            console.warn("⚠️ Gemini merge failed, tagging in Groq:", geminiError.message);
+            // Attempt 2: Groq Fallback
+            const completion = await groq.chat.completions.create({
+                messages: [{ role: "user", content: mergePrompt }],
+                model: "llama3-8b-8192", // Fast, free, great for summarization
+            });
+            mergeSummary = completion.choices[0]?.message?.content || "Branch merged successfully.";
+        }
 
-        // Step C: Inject summary into the target branch (Main) as a system message
         const { data: systemMsg, error } = await supabase
             .from('messages')
             .insert([{ 
@@ -120,7 +117,7 @@ app.post('/merge', async (req, res) => {
     }
 });
 
-// 5. Chat Endpoint (Unchanged from our working version)
+// 5. Chat Endpoint (With Groq Fallback)
 app.post('/chat', async (req, res) => {
     try {
         const { branch_id, prompt, parent_message_id } = req.body;
@@ -137,9 +134,28 @@ app.post('/chat', async (req, res) => {
             currentParentId = parentMsg.parent_message_id;
         }
 
-        const chat = model.startChat({ history: history });
-        const result = await chat.sendMessage(prompt);
-        const aiResponse = result.response.text();
+        let aiResponse = "";
+        try {
+            // Attempt 1: Gemini
+            const chat = model.startChat({ history: history });
+            const result = await chat.sendMessage(prompt);
+            aiResponse = result.response.text();
+        } catch (geminiError) {
+            console.warn("⚠️ Gemini chat failed, tagging in Groq:", geminiError.message);
+            
+            // Attempt 2: Groq Fallback! We have to translate Gemini's history format into OpenAI/Groq's format
+            const groqMessages = history.map(msg => ({
+                role: msg.role === 'model' ? 'assistant' : 'user',
+                content: msg.parts[0].text
+            }));
+            groqMessages.push({ role: 'user', content: prompt });
+
+            const completion = await groq.chat.completions.create({
+                messages: groqMessages,
+                model: "llama3-8b-8192", // Super generous free quota model
+            });
+            aiResponse = completion.choices[0]?.message?.content || "Sorry, both brains are currently offline!";
+        }
 
         const { data: aiMessage, error: aiMsgError } = await supabase.from('messages').insert([{ branch_id, sender_type: 'ai', content: aiResponse, parent_message_id: userMessage.id }]).select().single();
         if (aiMsgError) throw aiMsgError;
@@ -169,7 +185,6 @@ app.get('/branches/:workspace_id', async (req, res) => {
 // 7. Get message history for a specific branch
 app.get('/messages/:branch_id', async (req, res) => {
     try {
-        // Find the latest message in this branch to start our climb up the tree
         const { data: latestMsg, error: latestErr } = await supabase
             .from('messages')
             .select('id')
@@ -178,12 +193,11 @@ app.get('/messages/:branch_id', async (req, res) => {
             .limit(1)
             .single();
 
-        if (latestErr && latestErr.code !== 'PGRST116') throw latestErr; // Ignore 'not found' error
+        if (latestErr && latestErr.code !== 'PGRST116') throw latestErr;
 
         let history = [];
         if (latestMsg) {
             let currentId = latestMsg.id;
-            // Climb up the parent_message_id chain
             while (currentId) {
                 const { data: msg } = await supabase
                     .from('messages')

@@ -22,12 +22,31 @@ const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 app.post('/init', async (req, res) => {
     try {
         const { user_id, workspace_name } = req.body;
-        const { data: workspace, error: wsError } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
-        if (wsError) throw wsError;
-        const { data: branch, error: brError } = await supabase.from('branches').insert([{ workspace_id: workspace.id, name: 'main' }]).select().single();
-        if (brError) throw brError;
+        const { data: workspace, error: wsError } = await supabase
+            .from('workspaces')
+            .insert([{ name: workspace_name, created_by: user_id }])
+            .select()
+            .single();
+
+        if (wsError) {
+            console.error("Supabase Workspace Error:", wsError); // This shows in Render Logs
+            return res.status(500).json({ error: wsError.message, details: wsError.details }); // This shows in Browser
+        }
+
+        const { data: branch, error: brError } = await supabase
+            .from('branches')
+            .insert([{ workspace_id: workspace.id, name: 'main' }])
+            .select()
+            .single();
+
+        if (brError) {
+            console.error("Supabase Branch Error:", brError);
+            return res.status(500).json({ error: brError.message });
+        }
+
         res.json({ success: true, workspace, branch });
     } catch (error) {
+        console.error("Global Server Error:", error);
         res.status(500).json({ error: error.message });
     }
 });

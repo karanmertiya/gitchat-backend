@@ -8,7 +8,7 @@ import Groq from 'groq-sdk';
 dotenv.config();
 
 const app = express();
-// FIXED: Increased JSON limit to 10MB to support large file uploads!
+// High JSON limit to support uploading large code files
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json({ limit: '10mb' })); 
 
@@ -73,7 +73,6 @@ app.post('/merge', async (req, res) => {
     try {
         const { source_branch_id, target_branch_id, latest_message_id_in_source, parent_message_id_in_target } = req.body;
         
-        // FIXED: Bulletproof target parent locator ensures main timeline never breaks
         let actualTargetParentId = parent_message_id_in_target;
         if (!actualTargetParentId) {
             const { data: targetMsgs } = await supabase.from('messages')
@@ -88,7 +87,11 @@ app.post('/merge', async (req, res) => {
         while (currentId) {
             const { data: msg } = await supabase.from('messages').select('content, sender_type, parent_message_id').eq('id', currentId).single();
             if (!msg) break;
-            historyText = `[${msg.sender_type.toUpperCase()}]: ${msg.content}\n\n` + historyText;
+            
+            // STEALTH FILTER: Don't let the AI summarize system commits
+            if (msg.sender_type !== 'system') {
+                historyText = `[${msg.sender_type.toUpperCase()}]: ${msg.content}\n\n` + historyText;
+            }
             currentId = msg.parent_message_id;
         }
 
@@ -125,14 +128,17 @@ app.post('/chat', async (req, res) => {
             const { data: parentMsg } = await supabase.from('messages').select('content, sender_type, parent_message_id').eq('id', currentParentId).single();
             if (!parentMsg) break;
             
-            rawHistory.unshift({ 
-                role: parentMsg.sender_type === 'ai' ? 'model' : 'user', 
-                content: parentMsg.sender_type === 'system' ? `[SYSTEM NOTATION]: ${parentMsg.content}` : parentMsg.content 
-            });
+            // STEALTH FILTER: Hide system messages from the AI's context window!
+            if (parentMsg.sender_type !== 'system') {
+                rawHistory.unshift({ 
+                    role: parentMsg.sender_type === 'ai' ? 'model' : 'user', 
+                    content: parentMsg.content 
+                });
+            }
             currentParentId = parentMsg.parent_message_id;
         }
 
-        // FIXED: Context Collapser. Ensures Gemini's strictly alternating history requirement is never violated.
+        // Context Collapser: Ensures Gemini strictly alternates User/Model without crashing
         let history = [];
         for (let msg of rawHistory) {
             if (history.length === 0) {
@@ -147,7 +153,6 @@ app.post('/chat', async (req, res) => {
             }
         }
 
-        // Gemini explicitly crashes if the last historical message before the new prompt is also 'user'
         if (history.length > 0 && history[history.length - 1].role === 'user') {
             history.push({ role: 'model', parts: [{ text: 'Context acknowledged.' }] });
         }
@@ -158,7 +163,6 @@ app.post('/chat', async (req, res) => {
             const result = await chat.sendMessage(prompt);
             aiResponse = result.response.text();
         } catch (geminiError) {
-            console.warn("⚠️ Gemini chat failed, tagging in Groq:", geminiError.message);
             const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text }));
             groqMessages.push({ role: 'user', content: prompt });
             const completion = await groq.chat.completions.create({ messages: groqMessages, model: "llama-3.1-8b-instant" });

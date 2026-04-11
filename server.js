@@ -49,14 +49,13 @@ app.post('/init', async (req, res) => {
     }
 });
 
-// 2. Branching (NOW WITH ANCHOR COMMITS)
+// 2. Branching
 app.post('/branch', async (req, res) => {
     try {
         const { workspace_id, name, is_ephemeral, parent_message_id } = req.body;
         const { data: branch, error } = await supabase.from('branches').insert([{ workspace_id, name: name || 'New Branch', is_ephemeral: is_ephemeral || false }]).select().single();
         if (error) throw error;
 
-        // The Fix: Anchor the new branch to the timeline so context is never lost
         if (parent_message_id) {
             await supabase.from('messages').insert([{ 
                 branch_id: branch.id, 
@@ -83,10 +82,26 @@ app.patch('/branch/toggle', async (req, res) => {
     }
 });
 
-// 4. Merge Branch
+// 4. Merge Branch (FIXED TARGET PARENT LOGIC)
 app.post('/merge', async (req, res) => {
     try {
         const { source_branch_id, target_branch_id, latest_message_id_in_source, parent_message_id_in_target } = req.body;
+        
+        // Ensure we find the actual latest message in the target branch to attach the commit to!
+        let actualTargetParentId = parent_message_id_in_target;
+        if (!actualTargetParentId) {
+            const { data: latestTargetMsg } = await supabase
+                .from('messages')
+                .select('id')
+                .eq('branch_id', target_branch_id)
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle();
+            if (latestTargetMsg) {
+                actualTargetParentId = latestTargetMsg.id;
+            }
+        }
+
         let historyText = "";
         let currentId = latest_message_id_in_source;
         while (currentId) {
@@ -105,15 +120,21 @@ app.post('/merge', async (req, res) => {
             mergeSummary = "Branch merged successfully.";
         }
 
-        const { data: systemMsg, error } = await supabase.from('messages').insert([{ branch_id: target_branch_id, sender_type: 'system', content: `🔗 MERGE COMMIT: ${mergeSummary}`, parent_message_id: parent_message_id_in_target }]).select().single();
+        const { data: systemMsg, error } = await supabase.from('messages').insert([{ 
+            branch_id: target_branch_id, 
+            sender_type: 'system', 
+            content: `🔗 MERGE COMMIT: ${mergeSummary}`, 
+            parent_message_id: actualTargetParentId 
+        }]).select().single();
         if (error) throw error;
+        
         res.json({ success: true, mergeSummary: systemMsg.content, injectedMessageId: systemMsg.id });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-// 5. Chat Endpoint (NOW WITH CONTEXT SANITIZER)
+// 5. Chat Endpoint
 app.post('/chat', async (req, res) => {
     try {
         const { branch_id, prompt, parent_message_id } = req.body;
@@ -130,7 +151,6 @@ app.post('/chat', async (req, res) => {
             currentParentId = parentMsg.parent_message_id;
         }
 
-        // Fix: Gemini crashes if roles don't strictly alternate. Collapse consecutive user/system messages.
         let history = [];
         let lastRole = null;
         for (let msg of rawHistory) {

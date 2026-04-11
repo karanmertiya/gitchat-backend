@@ -29,46 +29,53 @@ app.post('/init', async (req, res) => {
     try {
         const { user_id, workspace_name } = req.body;
 
-        // 1. Try to find an existing workspace for this user
-        let { data: workspace } = await supabase
-            .from('branches')
+        // 1. Safely check if a workspace exists (using maybeSingle!)
+        const { data: existingWs, error: findWsError } = await supabase
+            .from('workspaces')
             .select('*')
-            .eq('workspace_id', workspace.id)
-            .eq('name', 'main')
-            .limit(1) 
-            .single();
+            .eq('created_by', user_id)
+            .eq('name', workspace_name)
+            .limit(1)
+            .maybeSingle(); 
 
-        // 2. If it doesn't exist, create it
-        if (!workspace) {
-            const { data: newWs, error: wsError } = await supabase
+        let currentWorkspace = existingWs;
+
+        // 2. If no workspace was found, create it
+        if (!currentWorkspace) {
+            const { data: newWs, error: createWsError } = await supabase
                 .from('workspaces')
                 .insert([{ name: workspace_name, created_by: user_id }])
                 .select()
                 .single();
-            if (wsError) throw wsError;
-            workspace = newWs;
+            
+            if (createWsError) throw createWsError;
+            currentWorkspace = newWs;
         }
 
-        // 3. Try to find the 'main' branch for this workspace
-        let { data: branch } = await supabase
+        // 3. Safely check if the 'main' branch exists for this workspace
+        const { data: existingBranch, error: findBrError } = await supabase
             .from('branches')
             .select('*')
-            .eq('workspace_id', workspace.id)
+            .eq('workspace_id', currentWorkspace.id)
             .eq('name', 'main')
-            .single();
+            .limit(1)
+            .maybeSingle();
 
-        // 4. If main branch doesn't exist, create it
-        if (!branch) {
-            const { data: newBr, error: brError } = await supabase
+        let currentBranch = existingBranch;
+
+        // 4. If no main branch was found, create it
+        if (!currentBranch) {
+            const { data: newBr, error: createBrError } = await supabase
                 .from('branches')
-                .insert([{ workspace_id: workspace.id, name: 'main' }])
+                .insert([{ workspace_id: currentWorkspace.id, name: 'main' }])
                 .select()
                 .single();
-            if (brError) throw brError;
-            branch = newBr;
+            
+            if (createBrError) throw createBrError;
+            currentBranch = newBr;
         }
 
-        res.json({ success: true, workspace, branch });
+        res.json({ success: true, workspace: currentWorkspace, branch: currentBranch });
     } catch (error) {
         console.error("Init Error:", error);
         res.status(500).json({ error: error.message });

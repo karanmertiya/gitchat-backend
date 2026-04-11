@@ -1,0 +1,15 @@
+# Dependency directories
+node_modules/
+
+# Environment variables
+.env
+
+# Optional npm cache and error logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm/
+
+# OS metadata
+.DS_Store
+Thumbs.db

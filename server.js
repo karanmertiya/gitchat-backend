@@ -47,9 +47,36 @@ app.post('/branch', async (req, res) => {
 
         let systemMsgId = null;
         if (parent_message_id) {
+            // THE NEW ARCHITECTURE: Fetch all ancestor messages
+            let ancestors = [];
+            let currentId = parent_message_id;
+            while (currentId) {
+                const { data: msg } = await supabase.from('messages').select('*').eq('id', currentId).single();
+                if (!msg) break;
+                ancestors.unshift(msg); // Prepend so chronological order is maintained
+                currentId = msg.parent_message_id;
+            }
+
+            // Duplicate the history directly into the new branch for perfect isolation
+            let previousId = null;
+            for (let msg of ancestors) {
+                const { data: copyMsg } = await supabase.from('messages').insert([{
+                    branch_id: branch.id,
+                    sender_type: msg.sender_type,
+                    content: msg.content,
+                    parent_message_id: previousId 
+                }]).select().single();
+                previousId = copyMsg.id;
+            }
+
+            // Finally, attach the system divergence message
             const { data: sysMsg } = await supabase.from('messages').insert([{ 
-                branch_id: branch.id, sender_type: 'system', content: `🌱 Timeline diverged: #${branch.name}`, parent_message_id: parent_message_id 
+                branch_id: branch.id, 
+                sender_type: 'system', 
+                content: `🌱 Timeline diverged: #${branch.name}`, 
+                parent_message_id: previousId 
             }]).select().single();
+            
             if(sysMsg) systemMsgId = sysMsg.id;
         }
         res.json({ success: true, branch, systemMsgId });
@@ -78,7 +105,6 @@ app.post('/merge', async (req, res) => {
             if (targetMsgs && targetMsgs.length > 0) actualTargetParentId = targetMsgs[0].id;
         }
 
-        // ARCHITECTURE UPGRADE: Use the ground-truth history from the frontend
         let historyText = "";
         if (frontendHistory && Array.isArray(frontendHistory)) {
             historyText = frontendHistory
@@ -116,7 +142,6 @@ app.post('/chat', async (req, res) => {
 
         let rawHistory = [];
         
-        // ARCHITECTURE UPGRADE: Use the ground-truth history from the frontend to bypass DB tracing bugs
         if (frontendHistory && Array.isArray(frontendHistory)) {
             rawHistory = frontendHistory
                 .filter(m => m.role !== 'system' && m.id !== 'temp')
@@ -137,7 +162,6 @@ app.post('/chat', async (req, res) => {
             }
         }
 
-        // Strict Gemini Formatting Rules
         if (history.length > 0 && history[0].role === 'model') {
             history.unshift({ role: 'user', parts: [{ text: 'Here is the context:' }] });
         }
@@ -151,7 +175,6 @@ app.post('/chat', async (req, res) => {
             const result = await chat.sendMessage(prompt);
             aiResponse = result.response.text();
         } catch (geminiError) {
-            console.warn("⚠️ Gemini chat failed, tagging in Groq:", geminiError.message);
             const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text }));
             groqMessages.push({ role: 'user', content: prompt });
             const completion = await groq.chat.completions.create({ messages: groqMessages, model: "llama-3.1-8b-instant" });

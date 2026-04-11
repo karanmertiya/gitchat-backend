@@ -14,6 +14,7 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
+// 1. Initialize a new Workspace and Main Branch
 app.post('/init', async (req, res) => {
     try {
         const { user_id, workspace_name } = req.body;
@@ -27,11 +28,35 @@ app.post('/init', async (req, res) => {
     }
 });
 
+// 2. Create a New Branch (The Git Checkout)
+app.post('/branch', async (req, res) => {
+    try {
+        const { workspace_id, name, is_ephemeral } = req.body;
+        
+        // We just create a new branch record. The message tree handles the actual history!
+        const { data: branch, error } = await supabase
+            .from('branches')
+            .insert([{ 
+                workspace_id, 
+                name: name || 'New Branch',
+                is_ephemeral: is_ephemeral || false 
+            }])
+            .select()
+            .single();
+
+        if (error) throw error;
+        res.json({ success: true, branch });
+    } catch (error) {
+        console.error("Branch Error:", error.message);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 3. Chat Endpoint (With Tree-Climbing Context Memory)
 app.post('/chat', async (req, res) => {
     try {
         const { branch_id, prompt, parent_message_id } = req.body;
 
-        // Step A: Save the User's Message
         const { data: userMessage, error: userMsgError } = await supabase
             .from('messages')
             .insert([{ branch_id, sender_type: 'user', content: prompt, parent_message_id: parent_message_id || null }])
@@ -39,13 +64,10 @@ app.post('/chat', async (req, res) => {
             .single();
         if (userMsgError) throw userMsgError;
 
-        // Step B: Climb the Tree
         let history = [];
         let currentParentId = parent_message_id;
-        
-        console.log(`\n[DEBUG] ----------------------------------`);
-        console.log(`[DEBUG] Incoming Prompt: "${prompt}"`);
-        console.log(`[DEBUG] Starting tree climb from parent ID: ${currentParentId}`);
+
+        console.log(`\n[DEBUG] Incoming Prompt: "${prompt}"`);
 
         while (currentParentId) {
             const { data: parentMsg, error } = await supabase
@@ -54,16 +76,7 @@ app.post('/chat', async (req, res) => {
                 .eq('id', currentParentId)
                 .single();
 
-            if (error) {
-                console.error(`[DEBUG] ❌ Supabase Error fetching message ${currentParentId}:`, error.message);
-                break;
-            }
-            if (!parentMsg) {
-                console.log(`[DEBUG] ⚠️ Message ${currentParentId} not found in DB.`);
-                break;
-            }
-
-            console.log(`[DEBUG] ✅ Found ancestor: Role [${parentMsg.sender_type}], Content Preview [${parentMsg.content.substring(0, 20)}...]`);
+            if (error || !parentMsg) break;
 
             history.unshift({
                 role: parentMsg.sender_type === 'ai' ? 'model' : 'user',
@@ -73,15 +86,10 @@ app.post('/chat', async (req, res) => {
             currentParentId = parentMsg.parent_message_id;
         }
 
-        console.log(`[DEBUG] Final History Array Length: ${history.length}`);
-        console.log(`[DEBUG] ----------------------------------\n`);
-
-        // Step C: Call Gemini
         const chat = model.startChat({ history: history });
         const result = await chat.sendMessage(prompt);
         const aiResponse = result.response.text();
 
-        // Step D: Save the AI's Message
         const { data: aiMessage, error: aiMsgError } = await supabase
             .from('messages')
             .insert([{ branch_id, sender_type: 'ai', content: aiResponse, parent_message_id: userMessage.id }])

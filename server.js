@@ -93,7 +93,7 @@ app.post('/merge', async (req, res) => {
             // Attempt 2: Groq Fallback
             const completion = await groq.chat.completions.create({
                 messages: [{ role: "user", content: mergePrompt }],
-                model: "llama3-8b-8192", // Fast, free, great for summarization
+                model: "llama-3.1-8b-instant", // Updated model
             });
             mergeSummary = completion.choices[0]?.message?.content || "Branch merged successfully.";
         }
@@ -143,7 +143,7 @@ app.post('/chat', async (req, res) => {
         } catch (geminiError) {
             console.warn("⚠️ Gemini chat failed, tagging in Groq:", geminiError.message);
             
-            // Attempt 2: Groq Fallback! We have to translate Gemini's history format into OpenAI/Groq's format
+            // Attempt 2: Groq Fallback! Translate Gemini's format into Groq's format
             const groqMessages = history.map(msg => ({
                 role: msg.role === 'model' ? 'assistant' : 'user',
                 content: msg.parts[0].text
@@ -152,7 +152,7 @@ app.post('/chat', async (req, res) => {
 
             const completion = await groq.chat.completions.create({
                 messages: groqMessages,
-                model: "llama3-8b-8192", // Super generous free quota model
+                model: "llama-3.1-8b-instant", // Updated model
             });
             aiResponse = completion.choices[0]?.message?.content || "Sorry, both brains are currently offline!";
         }

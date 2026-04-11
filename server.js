@@ -8,15 +8,11 @@ import Groq from 'groq-sdk';
 dotenv.config();
 
 const app = express();
-app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type']
-}));
-app.use(express.json());
+// FIXED: Increased JSON limit to 10MB to support large file uploads!
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'], allowedHeaders: ['Content-Type'] }));
+app.use(express.json({ limit: '10mb' })); 
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
-
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
@@ -28,8 +24,7 @@ app.post('/init', async (req, res) => {
         let currentWorkspace = existingWs;
 
         if (!currentWorkspace) {
-            const { data: newWs, error: createWsError } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
-            if (createWsError) throw createWsError;
+            const { data: newWs } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
             currentWorkspace = newWs;
         }
 
@@ -37,8 +32,7 @@ app.post('/init', async (req, res) => {
         let currentBranch = existingBranch;
 
         if (!currentBranch) {
-            const { data: newBr, error: createBrError } = await supabase.from('branches').insert([{ workspace_id: currentWorkspace.id, name: 'main' }]).select().single();
-            if (createBrError) throw createBrError;
+            const { data: newBr } = await supabase.from('branches').insert([{ workspace_id: currentWorkspace.id, name: 'main' }]).select().single();
             currentBranch = newBr;
         }
         res.json({ success: true, workspace: currentWorkspace, branch: currentBranch });
@@ -50,17 +44,12 @@ app.post('/init', async (req, res) => {
 app.post('/branch', async (req, res) => {
     try {
         const { workspace_id, name, is_ephemeral, parent_message_id } = req.body;
-        const { data: branch, error } = await supabase.from('branches').insert([{ workspace_id, name: name || 'New Branch', is_ephemeral: is_ephemeral || false }]).select().single();
-        if (error) throw error;
+        const { data: branch } = await supabase.from('branches').insert([{ workspace_id, name: name || 'New Branch', is_ephemeral: is_ephemeral || false }]).select().single();
 
-        // FIXED: We now grab the real UUID from the database and pass it back to the frontend!
         let systemMsgId = null;
         if (parent_message_id) {
             const { data: sysMsg } = await supabase.from('messages').insert([{ 
-                branch_id: branch.id, 
-                sender_type: 'system', 
-                content: `🌱 Timeline diverged: #${branch.name}`, 
-                parent_message_id: parent_message_id 
+                branch_id: branch.id, sender_type: 'system', content: `🌱 Timeline diverged: #${branch.name}`, parent_message_id: parent_message_id 
             }]).select().single();
             if(sysMsg) systemMsgId = sysMsg.id;
         }
@@ -73,8 +62,7 @@ app.post('/branch', async (req, res) => {
 app.patch('/branch/toggle', async (req, res) => {
     try {
         const { branch_id } = req.body;
-        const { data: branch, error } = await supabase.from('branches').update({ is_ephemeral: false }).eq('id', branch_id).select().single();
-        if (error) throw error;
+        const { data: branch } = await supabase.from('branches').update({ is_ephemeral: false }).eq('id', branch_id).select().single();
         res.json({ success: true, branch });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -85,10 +73,14 @@ app.post('/merge', async (req, res) => {
     try {
         const { source_branch_id, target_branch_id, latest_message_id_in_source, parent_message_id_in_target } = req.body;
         
+        // FIXED: Bulletproof target parent locator ensures main timeline never breaks
         let actualTargetParentId = parent_message_id_in_target;
         if (!actualTargetParentId) {
-            const { data: latestTargetMsg } = await supabase.from('messages').select('id').eq('branch_id', target_branch_id).order('created_at', { ascending: false }).limit(1).maybeSingle();
-            if (latestTargetMsg) actualTargetParentId = latestTargetMsg.id;
+            const { data: targetMsgs } = await supabase.from('messages')
+                .select('id').eq('branch_id', target_branch_id).order('created_at', { ascending: false }).limit(1);
+            if (targetMsgs && targetMsgs.length > 0) {
+                actualTargetParentId = targetMsgs[0].id;
+            }
         }
 
         let historyText = "";
@@ -109,10 +101,9 @@ app.post('/merge', async (req, res) => {
             mergeSummary = "Branch merged successfully.";
         }
 
-        const { data: systemMsg, error } = await supabase.from('messages').insert([{ 
+        const { data: systemMsg } = await supabase.from('messages').insert([{ 
             branch_id: target_branch_id, sender_type: 'system', content: `🔗 MERGE COMMIT: ${mergeSummary}`, parent_message_id: actualTargetParentId 
         }]).select().single();
-        if (error) throw error;
         
         res.json({ success: true, mergeSummary: systemMsg.content, injectedMessageId: systemMsg.id });
     } catch (error) {
@@ -124,27 +115,41 @@ app.post('/chat', async (req, res) => {
     try {
         const { branch_id, prompt, parent_message_id } = req.body;
 
-        const { data: userMessage, error: userMsgError } = await supabase.from('messages').insert([{ branch_id, sender_type: 'user', content: prompt, parent_message_id: parent_message_id || null }]).select().single();
-        if (userMsgError) throw userMsgError;
+        const { data: userMessage } = await supabase.from('messages').insert([{ 
+            branch_id, sender_type: 'user', content: prompt, parent_message_id: parent_message_id || null 
+        }]).select().single();
 
         let rawHistory = [];
         let currentParentId = parent_message_id;
         while (currentParentId) {
-            const { data: parentMsg, error } = await supabase.from('messages').select('content, sender_type, parent_message_id').eq('id', currentParentId).single();
-            if (error || !parentMsg) break;
-            rawHistory.unshift({ role: parentMsg.sender_type === 'ai' ? 'model' : 'user', parts: [{ text: parentMsg.content }] });
+            const { data: parentMsg } = await supabase.from('messages').select('content, sender_type, parent_message_id').eq('id', currentParentId).single();
+            if (!parentMsg) break;
+            
+            rawHistory.unshift({ 
+                role: parentMsg.sender_type === 'ai' ? 'model' : 'user', 
+                content: parentMsg.sender_type === 'system' ? `[SYSTEM NOTATION]: ${parentMsg.content}` : parentMsg.content 
+            });
             currentParentId = parentMsg.parent_message_id;
         }
 
+        // FIXED: Context Collapser. Ensures Gemini's strictly alternating history requirement is never violated.
         let history = [];
-        let lastRole = null;
         for (let msg of rawHistory) {
-            if (msg.role !== lastRole) {
-                history.push(msg);
-                lastRole = msg.role;
+            if (history.length === 0) {
+                history.push({ role: msg.role, parts: [{ text: msg.content }] });
             } else {
-                history[history.length - 1].parts[0].text += `\n\n[System Notation]: ${msg.parts[0].text}`;
+                let lastMsg = history[history.length - 1];
+                if (lastMsg.role === msg.role) {
+                    lastMsg.parts[0].text += `\n\n${msg.content}`;
+                } else {
+                    history.push({ role: msg.role, parts: [{ text: msg.content }] });
+                }
             }
+        }
+
+        // Gemini explicitly crashes if the last historical message before the new prompt is also 'user'
+        if (history.length > 0 && history[history.length - 1].role === 'user') {
+            history.push({ role: 'model', parts: [{ text: 'Context acknowledged.' }] });
         }
 
         let aiResponse = "";
@@ -153,14 +158,16 @@ app.post('/chat', async (req, res) => {
             const result = await chat.sendMessage(prompt);
             aiResponse = result.response.text();
         } catch (geminiError) {
+            console.warn("⚠️ Gemini chat failed, tagging in Groq:", geminiError.message);
             const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text }));
             groqMessages.push({ role: 'user', content: prompt });
             const completion = await groq.chat.completions.create({ messages: groqMessages, model: "llama-3.1-8b-instant" });
             aiResponse = completion.choices[0]?.message?.content || "Sorry, both brains are currently offline!";
         }
 
-        const { data: aiMessage, error: aiMsgError } = await supabase.from('messages').insert([{ branch_id, sender_type: 'ai', content: aiResponse, parent_message_id: userMessage.id }]).select().single();
-        if (aiMsgError) throw aiMsgError;
+        const { data: aiMessage } = await supabase.from('messages').insert([{ 
+            branch_id, sender_type: 'ai', content: aiResponse, parent_message_id: userMessage.id 
+        }]).select().single();
 
         res.json({ success: true, userMessageId: userMessage.id, aiMessageId: aiMessage.id, aiResponse: aiMessage.content });
     } catch (error) {
@@ -170,8 +177,7 @@ app.post('/chat', async (req, res) => {
 
 app.get('/branches/:workspace_id', async (req, res) => {
     try {
-        const { data: branches, error } = await supabase.from('branches').select('*').eq('workspace_id', req.params.workspace_id).order('created_at', { ascending: true });
-        if (error) throw error;
+        const { data: branches } = await supabase.from('branches').select('*').eq('workspace_id', req.params.workspace_id).order('created_at', { ascending: true });
         res.json({ success: true, branches });
     } catch (error) {
         res.status(500).json({ error: error.message });

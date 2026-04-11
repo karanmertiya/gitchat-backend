@@ -150,5 +150,62 @@ app.post('/chat', async (req, res) => {
     }
 });
 
+// 6. Get all branches for a workspace
+app.get('/branches/:workspace_id', async (req, res) => {
+    try {
+        const { data: branches, error } = await supabase
+            .from('branches')
+            .select('*')
+            .eq('workspace_id', req.params.workspace_id)
+            .order('created_at', { ascending: true });
+        
+        if (error) throw error;
+        res.json({ success: true, branches });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 7. Get message history for a specific branch
+app.get('/messages/:branch_id', async (req, res) => {
+    try {
+        // Find the latest message in this branch to start our climb up the tree
+        const { data: latestMsg, error: latestErr } = await supabase
+            .from('messages')
+            .select('id')
+            .eq('branch_id', req.params.branch_id)
+            .order('created_at', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (latestErr && latestErr.code !== 'PGRST116') throw latestErr; // Ignore 'not found' error
+
+        let history = [];
+        if (latestMsg) {
+            let currentId = latestMsg.id;
+            // Climb up the parent_message_id chain
+            while (currentId) {
+                const { data: msg } = await supabase
+                    .from('messages')
+                    .select('*')
+                    .eq('id', currentId)
+                    .single();
+                
+                if (!msg) break;
+                history.unshift({
+                    id: msg.id,
+                    role: msg.sender_type === 'ai' || msg.sender_type === 'system' ? 'ai' : 'user',
+                    content: msg.content,
+                    parent_message_id: msg.parent_message_id
+                });
+                currentId = msg.parent_message_id;
+            }
+        }
+        res.json({ success: true, messages: history });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Git-Chat API running on http://localhost:${PORT}`));

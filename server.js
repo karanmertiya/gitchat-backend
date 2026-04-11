@@ -21,11 +21,10 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// 1. Initialize
 app.post('/init', async (req, res) => {
     try {
         const { user_id, workspace_name } = req.body;
-        const { data: existingWs, error: findWsError } = await supabase.from('workspaces').select('*').eq('created_by', user_id).eq('name', workspace_name).limit(1).maybeSingle(); 
+        const { data: existingWs } = await supabase.from('workspaces').select('*').eq('created_by', user_id).eq('name', workspace_name).limit(1).maybeSingle(); 
         let currentWorkspace = existingWs;
 
         if (!currentWorkspace) {
@@ -34,7 +33,7 @@ app.post('/init', async (req, res) => {
             currentWorkspace = newWs;
         }
 
-        const { data: existingBranch, error: findBrError } = await supabase.from('branches').select('*').eq('workspace_id', currentWorkspace.id).eq('name', 'main').limit(1).maybeSingle();
+        const { data: existingBranch } = await supabase.from('branches').select('*').eq('workspace_id', currentWorkspace.id).eq('name', 'main').limit(1).maybeSingle();
         let currentBranch = existingBranch;
 
         if (!currentBranch) {
@@ -44,62 +43,52 @@ app.post('/init', async (req, res) => {
         }
         res.json({ success: true, workspace: currentWorkspace, branch: currentBranch });
     } catch (error) {
-        console.error("Init Error:", error);
         res.status(500).json({ error: error.message });
     }
 });
 
-// 2. Branching
 app.post('/branch', async (req, res) => {
     try {
         const { workspace_id, name, is_ephemeral, parent_message_id } = req.body;
         const { data: branch, error } = await supabase.from('branches').insert([{ workspace_id, name: name || 'New Branch', is_ephemeral: is_ephemeral || false }]).select().single();
         if (error) throw error;
 
+        // FIXED: We now grab the real UUID from the database and pass it back to the frontend!
+        let systemMsgId = null;
         if (parent_message_id) {
-            await supabase.from('messages').insert([{ 
+            const { data: sysMsg } = await supabase.from('messages').insert([{ 
                 branch_id: branch.id, 
                 sender_type: 'system', 
                 content: `🌱 Timeline diverged: #${branch.name}`, 
                 parent_message_id: parent_message_id 
-            }]);
+            }]).select().single();
+            if(sysMsg) systemMsgId = sysMsg.id;
         }
+        res.json({ success: true, branch, systemMsgId });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.patch('/branch/toggle', async (req, res) => {
+    try {
+        const { branch_id } = req.body;
+        const { data: branch, error } = await supabase.from('branches').update({ is_ephemeral: false }).eq('id', branch_id).select().single();
+        if (error) throw error;
         res.json({ success: true, branch });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-// 3. Toggle Ephemeral
-app.patch('/branch/toggle', async (req, res) => {
-    try {
-        const { branch_id } = req.body;
-        const { data: branch, error } = await supabase.from('branches').update({ is_ephemeral: false }).eq('id', branch_id).select().single();
-        if (error) throw error;
-        res.json({ success: true, message: "Branch is now permanent", branch });
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// 4. Merge Branch (FIXED TARGET PARENT LOGIC)
 app.post('/merge', async (req, res) => {
     try {
         const { source_branch_id, target_branch_id, latest_message_id_in_source, parent_message_id_in_target } = req.body;
         
-        // Ensure we find the actual latest message in the target branch to attach the commit to!
         let actualTargetParentId = parent_message_id_in_target;
         if (!actualTargetParentId) {
-            const { data: latestTargetMsg } = await supabase
-                .from('messages')
-                .select('id')
-                .eq('branch_id', target_branch_id)
-                .order('created_at', { ascending: false })
-                .limit(1)
-                .maybeSingle();
-            if (latestTargetMsg) {
-                actualTargetParentId = latestTargetMsg.id;
-            }
+            const { data: latestTargetMsg } = await supabase.from('messages').select('id').eq('branch_id', target_branch_id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+            if (latestTargetMsg) actualTargetParentId = latestTargetMsg.id;
         }
 
         let historyText = "";
@@ -121,10 +110,7 @@ app.post('/merge', async (req, res) => {
         }
 
         const { data: systemMsg, error } = await supabase.from('messages').insert([{ 
-            branch_id: target_branch_id, 
-            sender_type: 'system', 
-            content: `🔗 MERGE COMMIT: ${mergeSummary}`, 
-            parent_message_id: actualTargetParentId 
+            branch_id: target_branch_id, sender_type: 'system', content: `🔗 MERGE COMMIT: ${mergeSummary}`, parent_message_id: actualTargetParentId 
         }]).select().single();
         if (error) throw error;
         
@@ -134,7 +120,6 @@ app.post('/merge', async (req, res) => {
     }
 });
 
-// 5. Chat Endpoint
 app.post('/chat', async (req, res) => {
     try {
         const { branch_id, prompt, parent_message_id } = req.body;
@@ -168,7 +153,6 @@ app.post('/chat', async (req, res) => {
             const result = await chat.sendMessage(prompt);
             aiResponse = result.response.text();
         } catch (geminiError) {
-            console.warn("⚠️ Gemini chat failed, tagging in Groq:", geminiError.message);
             const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text }));
             groqMessages.push({ role: 'user', content: prompt });
             const completion = await groq.chat.completions.create({ messages: groqMessages, model: "llama-3.1-8b-instant" });
@@ -184,7 +168,6 @@ app.post('/chat', async (req, res) => {
     }
 });
 
-// 6. Get all branches
 app.get('/branches/:workspace_id', async (req, res) => {
     try {
         const { data: branches, error } = await supabase.from('branches').select('*').eq('workspace_id', req.params.workspace_id).order('created_at', { ascending: true });
@@ -195,10 +178,9 @@ app.get('/branches/:workspace_id', async (req, res) => {
     }
 });
 
-// 7. Get messages
 app.get('/messages/:branch_id', async (req, res) => {
     try {
-        const { data: latestMsg, error: latestErr } = await supabase.from('messages').select('id').eq('branch_id', req.params.branch_id).order('created_at', { ascending: false }).limit(1).maybeSingle();
+        const { data: latestMsg } = await supabase.from('messages').select('id').eq('branch_id', req.params.branch_id).order('created_at', { ascending: false }).limit(1).maybeSingle();
         let history = [];
         if (latestMsg) {
             let currentId = latestMsg.id;

@@ -31,10 +31,11 @@ app.post('/init', async (req, res) => {
 
         // 1. Try to find an existing workspace for this user
         let { data: workspace } = await supabase
-            .from('workspaces')
+            .from('branches')
             .select('*')
-            .eq('created_by', user_id)
-            .eq('name', workspace_name)
+            .eq('workspace_id', workspace.id)
+            .eq('name', 'main')
+            .limit(1) 
             .single();
 
         // 2. If it doesn't exist, create it

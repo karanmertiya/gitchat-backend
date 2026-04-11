@@ -24,16 +24,52 @@ const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 // Backup Engine: Groq (The speed demon with the crazy free tier)
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// 1. Initialize
+// 1. Initialize (Find or Create)
 app.post('/init', async (req, res) => {
     try {
         const { user_id, workspace_name } = req.body;
-        const { data: workspace, error: wsError } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
-        if (wsError) throw wsError;
-        const { data: branch, error: brError } = await supabase.from('branches').insert([{ workspace_id: workspace.id, name: 'main' }]).select().single();
-        if (brError) throw brError;
+
+        // 1. Try to find an existing workspace for this user
+        let { data: workspace } = await supabase
+            .from('workspaces')
+            .select('*')
+            .eq('created_by', user_id)
+            .eq('name', workspace_name)
+            .single();
+
+        // 2. If it doesn't exist, create it
+        if (!workspace) {
+            const { data: newWs, error: wsError } = await supabase
+                .from('workspaces')
+                .insert([{ name: workspace_name, created_by: user_id }])
+                .select()
+                .single();
+            if (wsError) throw wsError;
+            workspace = newWs;
+        }
+
+        // 3. Try to find the 'main' branch for this workspace
+        let { data: branch } = await supabase
+            .from('branches')
+            .select('*')
+            .eq('workspace_id', workspace.id)
+            .eq('name', 'main')
+            .single();
+
+        // 4. If main branch doesn't exist, create it
+        if (!branch) {
+            const { data: newBr, error: brError } = await supabase
+                .from('branches')
+                .insert([{ workspace_id: workspace.id, name: 'main' }])
+                .select()
+                .single();
+            if (brError) throw brError;
+            branch = newBr;
+        }
+
         res.json({ success: true, workspace, branch });
     } catch (error) {
+        console.error("Init Error:", error);
         res.status(500).json({ error: error.message });
     }
 });

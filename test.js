@@ -13,7 +13,7 @@ async function runTests() {
     try {
         // 1. Test Initialization
         console.log("\n1. Creating Workspace and Main Branch...");
-        const initRes = await fetch('http://localhost:3000/init', {
+        const initRes = await fetch('https://gitchat-backend.onrender.com/init', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ user_id: userId, workspace_name: "Context Test Run" })
@@ -25,7 +25,7 @@ async function runTests() {
 
         // 2. The First Message (Setting the context)
         console.log("\n2. Sending Message 1 (Setting Context)...");
-        const chatRes1 = await fetch('http://localhost:3000/chat', {
+        const chatRes1 = await fetch('https://gitchat-backend.onrender.com/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 
@@ -43,7 +43,7 @@ async function runTests() {
 
         // 3. The Second Message (Testing the memory via tree traversal)
         console.log("\n3. Sending Message 2 (Testing Memory)...");
-        const chatRes2 = await fetch('http://localhost:3000/chat', {
+        const chatRes2 = await fetch('https://gitchat-backend.onrender.com/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ 

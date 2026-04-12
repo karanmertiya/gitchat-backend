@@ -4,9 +4,8 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Groq from 'groq-sdk';
-
-// 🔥 THE FIX: Create a bridge for older CommonJS modules
 import { createRequire } from 'module';
+
 const require = createRequire(import.meta.url);
 const pdfParse = require('pdf-parse'); 
 
@@ -14,19 +13,20 @@ dotenv.config();
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'], allowedHeaders: ['Content-Type'] }));
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '50mb' })); 
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
-if (!supabaseUrl || !supabaseKey) {
-    console.error("🚨 CRITICAL: Missing Supabase Environment Variables!");
-}
+if (!supabaseUrl || !supabaseKey) console.error("🚨 CRITICAL: Missing Supabase Keys!");
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+
+// System instruction to force Claude-like artifact behavior
+const SYSTEM_PROMPT = `You are a senior developer AI in a Git-style workspace. When asked to write code, always wrap the complete code in standard markdown code blocks with the correct language identifier (e.g., \`\`\`python). This triggers the user's Artifact UI.`;
 
 app.post('/init', async (req, res) => {
     try {
@@ -66,7 +66,6 @@ app.post('/init', async (req, res) => {
         }
         res.json({ success: true, workspace: currentWorkspace, branch: currentBranch });
     } catch (error) {
-        console.error("Init Error:", error);
         res.status(500).json({ error: error.message });
     }
 });
@@ -171,35 +170,37 @@ app.post('/merge', async (req, res) => {
 app.post('/chat', async (req, res) => {
     try {
         const { branch_id, prompt, parent_message_id, frontendHistory, attachments } = req.body;
-        let finalPromptText = prompt;
+        
+        let finalPromptText = prompt || "";
         let geminiParts = [];
 
-        // 🔥 MULTIMODAL ENGINE: Process incoming attachments
+        // 🔥 MULTIMODAL & PDF ENGINE WITH INVISIBLE XML
         if (attachments && attachments.length > 0) {
             for (const file of attachments) {
-                const base64Data = file.base64.split(',')[1]; // Strip the data URL prefix
+                const base64Data = file.base64.split(',')[1];
                 const buffer = Buffer.from(base64Data, 'base64');
+                const fileNameSafe = file.name.toLowerCase();
 
-                if (file.type === 'application/pdf') {
-                    // Crack open the PDF and extract text
-                    const pdfData = await pdfParse(buffer);
-                    finalPromptText += `\n\n[Content of PDF: ${file.name}]\n${pdfData.text}`;
+                if (fileNameSafe.endsWith('.pdf')) {
+                    try {
+                        const pdfData = await pdfParse(buffer);
+                        finalPromptText += `\n\n<attachment name="${file.name}">\n${pdfData.text}\n</attachment>`;
+                    } catch (err) {
+                        console.error("PDF Parsing Failed:", err);
+                        finalPromptText += `\n\n<attachment name="${file.name}">\n[Error reading PDF contents]\n</attachment>`;
+                    }
                 } 
-                else if (file.type.startsWith('image/')) {
-                    // Send images natively to Gemini's visual cortex
-                    geminiParts.push({
-                        inlineData: { data: base64Data, mimeType: file.type }
-                    });
+                else if (file.type.startsWith('image/') || fileNameSafe.match(/\.(jpg|jpeg|png|webp)$/i)) {
+                    geminiParts.push({ inlineData: { data: base64Data, mimeType: file.type || 'image/jpeg' } });
+                    finalPromptText += `\n\n<attachment name="${file.name}">\n[Image Data Sent to Visual Cortex]\n</attachment>`;
                 } 
                 else {
-                    // Standard text/code files
                     const textContent = buffer.toString('utf-8');
-                    finalPromptText += `\n\n[Attached File: ${file.name}]\n\`\`\`\n${textContent}\n\`\`\``;
+                    finalPromptText += `\n\n<attachment name="${file.name}">\n${textContent}\n</attachment>`;
                 }
             }
         }
 
-        // Add the compiled text to the parts array
         geminiParts.unshift({ text: finalPromptText });
 
         const { data: userMessage } = await supabase.from('messages').insert([{ 
@@ -210,33 +211,40 @@ app.post('/chat', async (req, res) => {
         if (frontendHistory && Array.isArray(frontendHistory)) {
             rawHistory = frontendHistory.filter(m => m.role !== 'system' && m.id !== 'temp').map(m => ({ role: m.role === 'ai' ? 'model' : 'user', content: m.content }));
         }
-        let history = [];
+
+        let history = [{ role: 'user', parts: [{ text: SYSTEM_PROMPT }]}, { role: 'model', parts: [{ text: 'Understood.' }]}];
+        
         for (let msg of rawHistory) {
-            if (history.length === 0) {
-                history.push({ role: msg.role, parts: [{ text: msg.content }] });
+            let lastMsg = history[history.length - 1];
+            if (lastMsg.role === msg.role) {
+                lastMsg.parts[0].text += `\n\n${msg.content}`;
             } else {
-                let lastMsg = history[history.length - 1];
-                if (lastMsg.role === msg.role) lastMsg.parts[0].text += `\n\n${msg.content}`;
-                else history.push({ role: msg.role, parts: [{ text: msg.content }] });
+                history.push({ role: msg.role, parts: [{ text: msg.content }] });
             }
         }
 
-        if (history.length > 0 && history[0].role === 'model') history.unshift({ role: 'user', parts: [{ text: 'Here is the context:' }] });
-        if (history.length > 0 && history[history.length - 1].role === 'user') history.push({ role: 'model', parts: [{ text: 'Understood. Waiting for your next instruction.' }] });
         let aiResponse = "";
         try {
             const chat = model.startChat({ history: history });
-            // Send the multimodal parts (Text + Images) to Gemini
             const result = await chat.sendMessage(geminiParts);
             aiResponse = result.response.text();
         } catch (geminiError) {
             console.error("Gemini Error:", geminiError);
-            aiResponse = "I encountered an error processing your attachments or request. Make sure your files aren't too massive!";
+            try {
+                // Groq Fallback (Strips images out but keeps text context)
+                const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text }));
+                groqMessages.push({ role: 'user', content: finalPromptText });
+                const completion = await groq.chat.completions.create({ messages: groqMessages, model: "llama-3.1-8b-instant" });
+                aiResponse = completion.choices[0]?.message?.content || "Both AI brains are currently offline.";
+            } catch (groqErr) {
+                aiResponse = `I encountered an error processing your attachments. Error: ${geminiError.message}`;
+            }
         }
 
         const { data: aiMessage } = await supabase.from('messages').insert([{ 
             branch_id, sender_type: 'ai', content: aiResponse, parent_message_id: userMessage.id 
         }]).select().single();
+
         res.json({ success: true, userMessageId: userMessage.id, aiMessageId: aiMessage.id, aiResponse: aiMessage.content });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -247,24 +255,20 @@ app.post('/chitchat', async (req, res) => {
     try {
         const { workspace_id, user_name, prompt, history } = req.body;
         
-        // 1. Immediately log the human's message
         const { error: chatErr } = await supabase.from('chitchat_messages').insert([{ workspace_id, sender_name: user_name, role: 'user', content: prompt }]);
         if (chatErr) throw chatErr;
 
-        // 2. If Gemini is tagged, safely process it without the strict history crash
         if (prompt.includes('@gemini')) {
             const cleanPrompt = prompt.replace('@gemini', '').trim();
             let aiRes = "";
             
             try {
-                // Convert messy multiplayer history into a flat context string so Gemini doesn't crash
                 const contextStr = history ? history.map(h => `${h.role === 'model' ? 'Gemini' : 'User'}: ${h.parts[0].text}`).join('\n') : "";
                 const fullPrompt = `Here is the recent chat room context:\n${contextStr}\n\nA user just asked you: "${cleanPrompt}"\n\nProvide a helpful, concise response.`;
                 
                 const result = await model.generateContent(fullPrompt);
                 aiRes = result.response.text();
             } catch (geminiError) {
-                console.error("Gemini Chitchat Error, falling back to Groq:", geminiError.message);
                 const completion = await groq.chat.completions.create({ messages: [{ role: "user", content: cleanPrompt }], model: "llama-3.1-8b-instant" });
                 aiRes = completion.choices[0]?.message?.content || "I'm having trouble thinking right now!";
             }
@@ -319,4 +323,4 @@ app.get('/messages/:branch_id', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Git-Chat API running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Git-Chat API running on port ${PORT}`));

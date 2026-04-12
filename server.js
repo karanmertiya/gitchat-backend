@@ -22,7 +22,9 @@ if (!supabaseUrl || !supabaseKey) console.error("🚨 CRITICAL: Missing Supabase
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+// 🔥 THE FIX: Updated to 'gemini-1.5-flash-latest' to bypass the 404 error
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 // System instruction to force Claude-like artifact behavior

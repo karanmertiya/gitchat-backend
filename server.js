@@ -16,15 +16,25 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+// UPGRADE: Join Workspace via Link
 app.post('/init', async (req, res) => {
     try {
-        const { user_id, workspace_name } = req.body;
-        const { data: existingWs } = await supabase.from('workspaces').select('*').eq('created_by', user_id).eq('name', workspace_name).limit(1).maybeSingle(); 
-        let currentWorkspace = existingWs;
+        const { user_id, workspace_name, join_id } = req.body;
+        let currentWorkspace;
+
+        if (join_id) {
+            const { data: joinedWs } = await supabase.from('workspaces').select('*').eq('id', join_id).maybeSingle();
+            if (joinedWs) currentWorkspace = joinedWs;
+        }
 
         if (!currentWorkspace) {
-            const { data: newWs } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
-            currentWorkspace = newWs;
+            const { data: existingWs } = await supabase.from('workspaces').select('*').eq('created_by', user_id).eq('name', workspace_name).limit(1).maybeSingle();
+            if (existingWs) {
+                currentWorkspace = existingWs;
+            } else {
+                const { data: newWs } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
+                currentWorkspace = newWs;
+            }
         }
 
         const { data: existingBranch } = await supabase.from('branches').select('*').eq('workspace_id', currentWorkspace.id).eq('name', 'main').limit(1).maybeSingle();
@@ -40,17 +50,10 @@ app.post('/init', async (req, res) => {
     }
 });
 
-// UPGRADED: Now accepts parent_branch_id for hierarchical indentation
 app.post('/branch', async (req, res) => {
     try {
         const { workspace_id, name, is_ephemeral, parent_message_id, parent_branch_id } = req.body;
-        
-        const { data: branch } = await supabase.from('branches').insert([{ 
-            workspace_id, 
-            name: name || 'New Branch', 
-            is_ephemeral: is_ephemeral || false,
-            parent_branch_id: parent_branch_id || null
-        }]).select().single();
+        const { data: branch } = await supabase.from('branches').insert([{ workspace_id, name: name || 'New Branch', is_ephemeral: is_ephemeral || false, parent_branch_id: parent_branch_id || null }]).select().single();
 
         let systemMsgId = null;
         if (parent_message_id) {
@@ -65,22 +68,11 @@ app.post('/branch', async (req, res) => {
 
             let previousId = null;
             for (let msg of ancestors) {
-                const { data: copyMsg } = await supabase.from('messages').insert([{
-                    branch_id: branch.id,
-                    sender_type: msg.sender_type,
-                    content: msg.content,
-                    parent_message_id: previousId 
-                }]).select().single();
+                const { data: copyMsg } = await supabase.from('messages').insert([{ branch_id: branch.id, sender_type: msg.sender_type, content: msg.content, parent_message_id: previousId }]).select().single();
                 previousId = copyMsg.id;
             }
 
-            const { data: sysMsg } = await supabase.from('messages').insert([{ 
-                branch_id: branch.id, 
-                sender_type: 'system', 
-                content: `🌱 Timeline diverged: #${branch.name}`, 
-                parent_message_id: previousId 
-            }]).select().single();
-            
+            const { data: sysMsg } = await supabase.from('messages').insert([{ branch_id: branch.id, sender_type: 'system', content: `🌱 Timeline diverged: #${branch.name}`, parent_message_id: previousId }]).select().single();
             if(sysMsg) systemMsgId = sysMsg.id;
         }
         res.json({ success: true, branch, systemMsgId });
@@ -89,11 +81,9 @@ app.post('/branch', async (req, res) => {
     }
 });
 
-// NEW: Delete Branch Endpoint
 app.delete('/branch/:id', async (req, res) => {
     try {
-        const { error } = await supabase.from('branches').delete().eq('id', req.params.id);
-        if (error) throw error;
+        await supabase.from('branches').delete().eq('id', req.params.id);
         res.json({ success: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -110,7 +100,6 @@ app.patch('/branch/toggle', async (req, res) => {
     }
 });
 
-// UPGRADED MERGE: Squash & Consolidate approach
 app.post('/merge', async (req, res) => {
     try {
         const { source_branch_id, target_branch_id, latest_message_id_in_source, parent_message_id_in_target, frontendHistory } = req.body;
@@ -123,10 +112,7 @@ app.post('/merge', async (req, res) => {
 
         let historyText = "";
         if (frontendHistory && Array.isArray(frontendHistory)) {
-            historyText = frontendHistory
-                .filter(m => m.role !== 'system' && m.id !== 'temp')
-                .map(m => `[${m.role.toUpperCase()}]: ${m.content}`)
-                .join('\n\n');
+            historyText = frontendHistory.filter(m => m.role !== 'system' && m.id !== 'temp').map(m => `[${m.role.toUpperCase()}]: ${m.content}`).join('\n\n');
         }
 
         const mergePrompt = `You are a Git-Merge compiler agent. Extract the final, functional code, core decisions, or ultimate conclusion from this tangent timeline. Do not narrate. Output only the absolute final state or code to be merged back into main.\n\nTimeline:\n${historyText}`;
@@ -138,10 +124,7 @@ app.post('/merge', async (req, res) => {
             mergeSummary = "Branch merged successfully.";
         }
 
-        const { data: systemMsg } = await supabase.from('messages').insert([{ 
-            branch_id: target_branch_id, sender_type: 'system', content: `🚀 SQUASH & MERGE COMPLETE\n\n${mergeSummary}`, parent_message_id: actualTargetParentId 
-        }]).select().single();
-        
+        const { data: systemMsg } = await supabase.from('messages').insert([{ branch_id: target_branch_id, sender_type: 'system', content: `🚀 SQUASH & MERGE COMPLETE\n\n${mergeSummary}`, parent_message_id: actualTargetParentId }]).select().single();
         res.json({ success: true, mergeSummary: systemMsg.content, injectedMessageId: systemMsg.id });
     } catch (error) {
         res.status(500).json({ error: error.message });
@@ -151,16 +134,11 @@ app.post('/merge', async (req, res) => {
 app.post('/chat', async (req, res) => {
     try {
         const { branch_id, prompt, parent_message_id, frontendHistory } = req.body;
-
-        const { data: userMessage } = await supabase.from('messages').insert([{ 
-            branch_id, sender_type: 'user', content: prompt, parent_message_id: parent_message_id || null 
-        }]).select().single();
+        const { data: userMessage } = await supabase.from('messages').insert([{ branch_id, sender_type: 'user', content: prompt, parent_message_id: parent_message_id || null }]).select().single();
 
         let rawHistory = [];
         if (frontendHistory && Array.isArray(frontendHistory)) {
-            rawHistory = frontendHistory
-                .filter(m => m.role !== 'system' && m.id !== 'temp')
-                .map(m => ({ role: m.role === 'ai' ? 'model' : 'user', content: m.content }));
+            rawHistory = frontendHistory.filter(m => m.role !== 'system' && m.id !== 'temp').map(m => ({ role: m.role === 'ai' ? 'model' : 'user', content: m.content }));
         }
 
         let history = [];
@@ -177,12 +155,8 @@ app.post('/chat', async (req, res) => {
             }
         }
 
-        if (history.length > 0 && history[0].role === 'model') {
-            history.unshift({ role: 'user', parts: [{ text: 'Here is the context:' }] });
-        }
-        if (history.length > 0 && history[history.length - 1].role === 'user') {
-            history.push({ role: 'model', parts: [{ text: 'Understood. Waiting for your next instruction.' }] });
-        }
+        if (history.length > 0 && history[0].role === 'model') history.unshift({ role: 'user', parts: [{ text: 'Here is the context:' }] });
+        if (history.length > 0 && history[history.length - 1].role === 'user') history.push({ role: 'model', parts: [{ text: 'Understood. Waiting for your next instruction.' }] });
 
         let aiResponse = "";
         try {
@@ -196,23 +170,39 @@ app.post('/chat', async (req, res) => {
             aiResponse = completion.choices[0]?.message?.content || "Sorry, both brains are currently offline!";
         }
 
-        const { data: aiMessage } = await supabase.from('messages').insert([{ 
-            branch_id, sender_type: 'ai', content: aiResponse, parent_message_id: userMessage.id 
-        }]).select().single();
-
+        const { data: aiMessage } = await supabase.from('messages').insert([{ branch_id, sender_type: 'ai', content: aiResponse, parent_message_id: userMessage.id }]).select().single();
         res.json({ success: true, userMessageId: userMessage.id, aiMessageId: aiMessage.id, aiResponse: aiMessage.content });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
 });
 
-// NEW: Specialized Chitchat Endpoint (Only called when @gemini is tagged)
+// UPGRADE: Multiplayer Chitchat Logic
 app.post('/chitchat', async (req, res) => {
     try {
-        const { prompt, history } = req.body;
-        const chat = model.startChat({ history: history || [] });
-        const result = await chat.sendMessage(prompt.replace('@gemini', '').trim());
-        res.json({ success: true, response: result.response.text() });
+        const { workspace_id, user_name, prompt, history } = req.body;
+        
+        await supabase.from('chitchat_messages').insert([{ workspace_id, sender_name: user_name, role: 'user', content: prompt }]);
+
+        if (prompt.includes('@gemini')) {
+            const chat = model.startChat({ history: history || [] });
+            const result = await chat.sendMessage(prompt.replace('@gemini', '').trim());
+            const aiRes = result.response.text();
+            
+            await supabase.from('chitchat_messages').insert([{ workspace_id, sender_name: 'Gemini', role: 'ai', content: aiRes }]);
+            res.json({ success: true, response: aiRes });
+        } else {
+            res.json({ success: true });
+        }
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/chitchat/:workspace_id', async (req, res) => {
+    try {
+        const { data } = await supabase.from('chitchat_messages').select('*').eq('workspace_id', req.params.workspace_id).order('created_at', { ascending: true });
+        res.json({ success: true, messages: data });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

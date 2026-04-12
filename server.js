@@ -22,12 +22,9 @@ if (!supabaseUrl || !supabaseKey) console.error("🚨 CRITICAL: Missing Supabase
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-// 🔥 THE FIX: Updated to 'gemini-1.5-flash-latest' to bypass the 404 error
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// System instruction to force Claude-like artifact behavior
 const SYSTEM_PROMPT = `You are a senior developer AI in a Git-style workspace. When asked to write code, always wrap the complete code in standard markdown code blocks with the correct language identifier (e.g., \`\`\`python). This triggers the user's Artifact UI.`;
 
 app.post('/init', async (req, res) => {
@@ -176,7 +173,7 @@ app.post('/chat', async (req, res) => {
         let finalPromptText = prompt || "";
         let geminiParts = [];
 
-        // 🔥 MULTIMODAL & PDF ENGINE WITH INVISIBLE XML
+        // 🔥 MULTIMODAL & PDF ENGINE WITH BULLETPROOF MARKERS
         if (attachments && attachments.length > 0) {
             for (const file of attachments) {
                 const base64Data = file.base64.split(',')[1];
@@ -186,19 +183,18 @@ app.post('/chat', async (req, res) => {
                 if (fileNameSafe.endsWith('.pdf')) {
                     try {
                         const pdfData = await pdfParse(buffer);
-                        finalPromptText += `\n\n<attachment name="${file.name}">\n${pdfData.text}\n</attachment>`;
+                        finalPromptText += `\n\n---START_ATTACHMENT:${file.name}---\n${pdfData.text}\n---END_ATTACHMENT---`;
                     } catch (err) {
-                        console.error("PDF Parsing Failed:", err);
-                        finalPromptText += `\n\n<attachment name="${file.name}">\n[Error reading PDF contents]\n</attachment>`;
+                        finalPromptText += `\n\n---START_ATTACHMENT:${file.name}---\n[Error reading PDF contents]\n---END_ATTACHMENT---`;
                     }
                 } 
                 else if (file.type.startsWith('image/') || fileNameSafe.match(/\.(jpg|jpeg|png|webp)$/i)) {
                     geminiParts.push({ inlineData: { data: base64Data, mimeType: file.type || 'image/jpeg' } });
-                    finalPromptText += `\n\n<attachment name="${file.name}">\n[Image Data Sent to Visual Cortex]\n</attachment>`;
+                    finalPromptText += `\n\n---START_ATTACHMENT:${file.name}---\n[Image sent to Visual Cortex]\n---END_ATTACHMENT---`;
                 } 
                 else {
                     const textContent = buffer.toString('utf-8');
-                    finalPromptText += `\n\n<attachment name="${file.name}">\n${textContent}\n</attachment>`;
+                    finalPromptText += `\n\n---START_ATTACHMENT:${file.name}---\n${textContent}\n---END_ATTACHMENT---`;
                 }
             }
         }
@@ -231,15 +227,17 @@ app.post('/chat', async (req, res) => {
             const result = await chat.sendMessage(geminiParts);
             aiResponse = result.response.text();
         } catch (geminiError) {
-            console.error("Gemini Error:", geminiError);
+            console.error("Gemini Failure:", geminiError.message);
             try {
-                // Groq Fallback (Strips images out but keeps text context)
-                const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text }));
-                groqMessages.push({ role: 'user', content: finalPromptText });
+                // 🔥 GROQ AUTO-TRUNCATOR (Limits context to 15,000 chars so massive PDFs don't crash the fallback)
+                const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text.substring(0, 10000) }));
+                groqMessages.push({ role: 'user', content: finalPromptText.substring(0, 15000) });
                 const completion = await groq.chat.completions.create({ messages: groqMessages, model: "llama-3.1-8b-instant" });
-                aiResponse = completion.choices[0]?.message?.content || "Both AI brains are currently offline.";
+                aiResponse = completion.choices[0]?.message?.content;
+                if (!aiResponse) throw new Error("Groq returned empty string.");
             } catch (groqErr) {
-                aiResponse = `I encountered an error processing your attachments. Error: ${geminiError.message}`;
+                console.error("Groq Failure:", groqErr.message);
+                aiResponse = `🚨 **Both AI Engines Failed to Respond.**\n\n**Gemini Error:** ${geminiError.message}\n**Groq Error:** ${groqErr.message}\n\n*(Note: If Gemini returns 404, your region/API key is restricted. If Groq fails, the file is simply too massive for its context window.)*`;
             }
         }
 
@@ -271,8 +269,10 @@ app.post('/chitchat', async (req, res) => {
                 const result = await model.generateContent(fullPrompt);
                 aiRes = result.response.text();
             } catch (geminiError) {
-                const completion = await groq.chat.completions.create({ messages: [{ role: "user", content: cleanPrompt }], model: "llama-3.1-8b-instant" });
-                aiRes = completion.choices[0]?.message?.content || "I'm having trouble thinking right now!";
+                try {
+                    const completion = await groq.chat.completions.create({ messages: [{ role: "user", content: cleanPrompt.substring(0, 5000) }], model: "llama-3.1-8b-instant" });
+                    aiRes = completion.choices[0]?.message?.content || "I'm having trouble thinking right now!";
+                } catch(e) { aiRes = "Offline."; }
             }
             
             await supabase.from('chitchat_messages').insert([{ workspace_id, sender_name: 'Gemini', role: 'ai', content: aiRes }]);

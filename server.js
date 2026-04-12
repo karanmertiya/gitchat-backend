@@ -6,18 +6,16 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import Groq from 'groq-sdk';
 
 dotenv.config();
-console.log("🔥 RENDER IS POINTING TO:", process.env.SUPABASE_URL);
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json({ limit: '10mb' })); 
 
-// 🔥 UPGRADE: Use the Service Role Key to give the backend "God Mode"
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
 if (!supabaseUrl || !supabaseKey) {
-    console.error("🚨 CRITICAL: Missing Supabase Environment Variables in Render!");
+    console.error("🚨 CRITICAL: Missing Supabase Environment Variables!");
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
@@ -32,14 +30,12 @@ app.post('/init', async (req, res) => {
 
         if (!user_id) throw new Error("Missing user_id from frontend.");
 
-        // 1. Check if joining an existing workspace
         if (join_id) {
             const { data: joinedWs, error: joinErr } = await supabase.from('workspaces').select('*').eq('id', join_id).maybeSingle();
             if (joinErr) throw joinErr;
             if (joinedWs) currentWorkspace = joinedWs;
         }
 
-        // 2. If not joining, find or create the personal workspace
         if (!currentWorkspace) {
             const { data: existingWs, error: existErr } = await supabase.from('workspaces').select('*').eq('created_by', user_id).eq('name', workspace_name).limit(1).maybeSingle();
             if (existErr) throw existErr;
@@ -48,16 +44,11 @@ app.post('/init', async (req, res) => {
                 currentWorkspace = existingWs;
             } else {
                 const { data: newWs, error: createWsError } = await supabase.from('workspaces').insert([{ name: workspace_name, created_by: user_id }]).select().single();
-                
-                // FIXED: Strict error throwing prevents silent null crashes!
                 if (createWsError) throw new Error(`Database Insert Failed: ${createWsError.message}`);
-                if (!newWs) throw new Error("Database returned null after workspace creation.");
-                
                 currentWorkspace = newWs;
             }
         }
 
-        // 3. Ensure Main Branch exists
         const { data: existingBranch, error: branchErr } = await supabase.from('branches').select('*').eq('workspace_id', currentWorkspace.id).eq('name', 'main').limit(1).maybeSingle();
         if (branchErr) throw branchErr;
         
@@ -230,13 +221,27 @@ app.post('/chitchat', async (req, res) => {
     try {
         const { workspace_id, user_name, prompt, history } = req.body;
         
+        // 1. Immediately log the human's message
         const { error: chatErr } = await supabase.from('chitchat_messages').insert([{ workspace_id, sender_name: user_name, role: 'user', content: prompt }]);
         if (chatErr) throw chatErr;
 
+        // 2. If Gemini is tagged, safely process it without the strict history crash
         if (prompt.includes('@gemini')) {
-            const chat = model.startChat({ history: history || [] });
-            const result = await chat.sendMessage(prompt.replace('@gemini', '').trim());
-            const aiRes = result.response.text();
+            const cleanPrompt = prompt.replace('@gemini', '').trim();
+            let aiRes = "";
+            
+            try {
+                // Convert messy multiplayer history into a flat context string so Gemini doesn't crash
+                const contextStr = history ? history.map(h => `${h.role === 'model' ? 'Gemini' : 'User'}: ${h.parts[0].text}`).join('\n') : "";
+                const fullPrompt = `Here is the recent chat room context:\n${contextStr}\n\nA user just asked you: "${cleanPrompt}"\n\nProvide a helpful, concise response.`;
+                
+                const result = await model.generateContent(fullPrompt);
+                aiRes = result.response.text();
+            } catch (geminiError) {
+                console.error("Gemini Chitchat Error, falling back to Groq:", geminiError.message);
+                const completion = await groq.chat.completions.create({ messages: [{ role: "user", content: cleanPrompt }], model: "llama-3.1-8b-instant" });
+                aiRes = completion.choices[0]?.message?.content || "I'm having trouble thinking right now!";
+            }
             
             await supabase.from('chitchat_messages').insert([{ workspace_id, sender_name: 'Gemini', role: 'ai', content: aiRes }]);
             res.json({ success: true, response: aiRes });

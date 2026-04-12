@@ -6,6 +6,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import Groq from 'groq-sdk';
 
 dotenv.config();
+console.log("🔥 RENDER IS POINTING TO:", process.env.SUPABASE_URL);
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'], allowedHeaders: ['Content-Type'] }));

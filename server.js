@@ -4,18 +4,24 @@ import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Groq from 'groq-sdk';
-import pdfParse from 'pdf-parse'; // 🔥 NEW: PDF Parsing Engine
+
+// 🔥 THE FIX: Create a bridge for older CommonJS modules
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const pdfParse = require('pdf-parse'); 
 
 dotenv.config();
 
 const app = express();
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PATCH', 'DELETE'], allowedHeaders: ['Content-Type'] }));
-app.use(express.json({ limit: '50mb' })); // Increased to 50mb for large PDFs and Images
+app.use(express.json({ limit: '50mb' }));
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
-if (!supabaseUrl || !supabaseKey) console.error("🚨 CRITICAL: Missing Supabase Keys!");
+if (!supabaseUrl || !supabaseKey) {
+    console.error("🚨 CRITICAL: Missing Supabase Environment Variables!");
+}
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);

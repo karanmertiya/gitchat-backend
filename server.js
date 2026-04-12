@@ -40,24 +40,29 @@ app.post('/init', async (req, res) => {
     }
 });
 
+// UPGRADED: Now accepts parent_branch_id for hierarchical indentation
 app.post('/branch', async (req, res) => {
     try {
-        const { workspace_id, name, is_ephemeral, parent_message_id } = req.body;
-        const { data: branch } = await supabase.from('branches').insert([{ workspace_id, name: name || 'New Branch', is_ephemeral: is_ephemeral || false }]).select().single();
+        const { workspace_id, name, is_ephemeral, parent_message_id, parent_branch_id } = req.body;
+        
+        const { data: branch } = await supabase.from('branches').insert([{ 
+            workspace_id, 
+            name: name || 'New Branch', 
+            is_ephemeral: is_ephemeral || false,
+            parent_branch_id: parent_branch_id || null
+        }]).select().single();
 
         let systemMsgId = null;
         if (parent_message_id) {
-            // THE NEW ARCHITECTURE: Fetch all ancestor messages
             let ancestors = [];
             let currentId = parent_message_id;
             while (currentId) {
                 const { data: msg } = await supabase.from('messages').select('*').eq('id', currentId).single();
                 if (!msg) break;
-                ancestors.unshift(msg); // Prepend so chronological order is maintained
+                ancestors.unshift(msg); 
                 currentId = msg.parent_message_id;
             }
 
-            // Duplicate the history directly into the new branch for perfect isolation
             let previousId = null;
             for (let msg of ancestors) {
                 const { data: copyMsg } = await supabase.from('messages').insert([{
@@ -69,7 +74,6 @@ app.post('/branch', async (req, res) => {
                 previousId = copyMsg.id;
             }
 
-            // Finally, attach the system divergence message
             const { data: sysMsg } = await supabase.from('messages').insert([{ 
                 branch_id: branch.id, 
                 sender_type: 'system', 
@@ -85,6 +89,17 @@ app.post('/branch', async (req, res) => {
     }
 });
 
+// NEW: Delete Branch Endpoint
+app.delete('/branch/:id', async (req, res) => {
+    try {
+        const { error } = await supabase.from('branches').delete().eq('id', req.params.id);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
 app.patch('/branch/toggle', async (req, res) => {
     try {
         const { branch_id } = req.body;
@@ -95,6 +110,7 @@ app.patch('/branch/toggle', async (req, res) => {
     }
 });
 
+// UPGRADED MERGE: Squash & Consolidate approach
 app.post('/merge', async (req, res) => {
     try {
         const { source_branch_id, target_branch_id, latest_message_id_in_source, parent_message_id_in_target, frontendHistory } = req.body;
@@ -113,7 +129,7 @@ app.post('/merge', async (req, res) => {
                 .join('\n\n');
         }
 
-        const mergePrompt = `You are a Git-Merge agent. Summarize the following timeline into 2 concise sentences of conclusions/decisions made.\n\nTimeline:\n${historyText}`;
+        const mergePrompt = `You are a Git-Merge compiler agent. Extract the final, functional code, core decisions, or ultimate conclusion from this tangent timeline. Do not narrate. Output only the absolute final state or code to be merged back into main.\n\nTimeline:\n${historyText}`;
         let mergeSummary = "";
         try {
             const completion = await groq.chat.completions.create({ messages: [{ role: "user", content: mergePrompt }], model: "llama-3.1-8b-instant" });
@@ -123,7 +139,7 @@ app.post('/merge', async (req, res) => {
         }
 
         const { data: systemMsg } = await supabase.from('messages').insert([{ 
-            branch_id: target_branch_id, sender_type: 'system', content: `🔗 MERGE COMMIT: ${mergeSummary}`, parent_message_id: actualTargetParentId 
+            branch_id: target_branch_id, sender_type: 'system', content: `🚀 SQUASH & MERGE COMPLETE\n\n${mergeSummary}`, parent_message_id: actualTargetParentId 
         }]).select().single();
         
         res.json({ success: true, mergeSummary: systemMsg.content, injectedMessageId: systemMsg.id });
@@ -141,7 +157,6 @@ app.post('/chat', async (req, res) => {
         }]).select().single();
 
         let rawHistory = [];
-        
         if (frontendHistory && Array.isArray(frontendHistory)) {
             rawHistory = frontendHistory
                 .filter(m => m.role !== 'system' && m.id !== 'temp')
@@ -186,6 +201,18 @@ app.post('/chat', async (req, res) => {
         }]).select().single();
 
         res.json({ success: true, userMessageId: userMessage.id, aiMessageId: aiMessage.id, aiResponse: aiMessage.content });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// NEW: Specialized Chitchat Endpoint (Only called when @gemini is tagged)
+app.post('/chitchat', async (req, res) => {
+    try {
+        const { prompt, history } = req.body;
+        const chat = model.startChat({ history: history || [] });
+        const result = await chat.sendMessage(prompt.replace('@gemini', '').trim());
+        res.json({ success: true, response: result.response.text() });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }

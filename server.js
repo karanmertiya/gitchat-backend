@@ -25,8 +25,8 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// 🔥 UPGRADED: Nuclear System Prompt to prevent Llama-3 from hallucinating website buttons
-const SYSTEM_PROMPT = `You are an elite, senior AI developer assistant. CRITICAL INSTRUCTION: Whenever you provide code, scripts, or data pipelines, YOU MUST ALWAYS wrap them entirely within standard Markdown code blocks with the correct language tag (e.g., \`\`\`python ... \`\`\`). NEVER output raw unformatted code. NEVER output website artifacts like 'Open in Editor' or 'Click to Copy'. Speak strictly as an AI assistant providing clean, formatted markdown.`;
+// 🔥 UPGRADED: Nuclear System Prompt enforcing filenames
+const SYSTEM_PROMPT = `You are an elite, senior AI developer assistant. CRITICAL INSTRUCTION: Whenever you provide code, scripts, or data pipelines, YOU MUST ALWAYS wrap them entirely within standard Markdown code blocks. You MUST include a filename directly in the markdown tag. Format exactly like this: \`\`\`python filename="main.py"\n[code]\n\`\`\` NEVER output website artifacts like 'Open in Editor' or 'Click to Copy'. Speak strictly as an AI assistant providing clean, formatted markdown.`;
 
 app.post('/init', async (req, res) => {
     try {
@@ -210,7 +210,7 @@ app.post('/chat', async (req, res) => {
             rawHistory = frontendHistory.filter(m => m.role !== 'system' && m.id !== 'temp').map(m => ({ role: m.role === 'ai' ? 'model' : 'user', content: m.content }));
         }
 
-        let history = [{ role: 'user', parts: [{ text: SYSTEM_PROMPT }]}, { role: 'model', parts: [{ text: 'Understood. I will strictly use markdown for code.' }]}];
+        let history = [{ role: 'user', parts: [{ text: SYSTEM_PROMPT }]}, { role: 'model', parts: [{ text: 'Understood. I will strictly use markdown for code and always include the filename tag.' }]}];
         
         for (let msg of rawHistory) {
             let lastMsg = history[history.length - 1];
@@ -229,7 +229,6 @@ app.post('/chat', async (req, res) => {
         } catch (geminiError) {
             console.error("Gemini Failure:", geminiError.message);
             try {
-                // 🔥 UPGRADED: Explicitly telling Groq that the first message is a System rule, so it obeys it.
                 const groqMessages = history.map((msg, index) => {
                     if (index === 0) return { role: 'system', content: msg.parts[0].text };
                     return { role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text.substring(0, 10000) };

@@ -22,10 +22,11 @@ if (!supabaseUrl || !supabaseKey) console.error("🚨 CRITICAL: Missing Supabase
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const SYSTEM_PROMPT = `You are a senior developer AI in a Git-style workspace. When asked to write code, always wrap the complete code in standard markdown code blocks with the correct language identifier (e.g., \`\`\`python). This triggers the user's Artifact UI.`;
+// 🔥 UPGRADED: Nuclear System Prompt to prevent Llama-3 from hallucinating website buttons
+const SYSTEM_PROMPT = `You are an elite, senior AI developer assistant. CRITICAL INSTRUCTION: Whenever you provide code, scripts, or data pipelines, YOU MUST ALWAYS wrap them entirely within standard Markdown code blocks with the correct language tag (e.g., \`\`\`python ... \`\`\`). NEVER output raw unformatted code. NEVER output website artifacts like 'Open in Editor' or 'Click to Copy'. Speak strictly as an AI assistant providing clean, formatted markdown.`;
 
 app.post('/init', async (req, res) => {
     try {
@@ -173,7 +174,6 @@ app.post('/chat', async (req, res) => {
         let finalPromptText = prompt || "";
         let geminiParts = [];
 
-        // 🔥 MULTIMODAL & PDF ENGINE WITH BULLETPROOF MARKERS
         if (attachments && attachments.length > 0) {
             for (const file of attachments) {
                 const base64Data = file.base64.split(',')[1];
@@ -210,7 +210,7 @@ app.post('/chat', async (req, res) => {
             rawHistory = frontendHistory.filter(m => m.role !== 'system' && m.id !== 'temp').map(m => ({ role: m.role === 'ai' ? 'model' : 'user', content: m.content }));
         }
 
-        let history = [{ role: 'user', parts: [{ text: SYSTEM_PROMPT }]}, { role: 'model', parts: [{ text: 'Understood.' }]}];
+        let history = [{ role: 'user', parts: [{ text: SYSTEM_PROMPT }]}, { role: 'model', parts: [{ text: 'Understood. I will strictly use markdown for code.' }]}];
         
         for (let msg of rawHistory) {
             let lastMsg = history[history.length - 1];
@@ -229,15 +229,19 @@ app.post('/chat', async (req, res) => {
         } catch (geminiError) {
             console.error("Gemini Failure:", geminiError.message);
             try {
-                // 🔥 GROQ AUTO-TRUNCATOR (Limits context to 15,000 chars so massive PDFs don't crash the fallback)
-                const groqMessages = history.map(msg => ({ role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text.substring(0, 10000) }));
+                // 🔥 UPGRADED: Explicitly telling Groq that the first message is a System rule, so it obeys it.
+                const groqMessages = history.map((msg, index) => {
+                    if (index === 0) return { role: 'system', content: msg.parts[0].text };
+                    return { role: msg.role === 'model' ? 'assistant' : 'user', content: msg.parts[0].text.substring(0, 10000) };
+                });
                 groqMessages.push({ role: 'user', content: finalPromptText.substring(0, 15000) });
+                
                 const completion = await groq.chat.completions.create({ messages: groqMessages, model: "llama-3.1-8b-instant" });
                 aiResponse = completion.choices[0]?.message?.content;
                 if (!aiResponse) throw new Error("Groq returned empty string.");
             } catch (groqErr) {
                 console.error("Groq Failure:", groqErr.message);
-                aiResponse = `🚨 **Both AI Engines Failed to Respond.**\n\n**Gemini Error:** ${geminiError.message}\n**Groq Error:** ${groqErr.message}\n\n*(Note: If Gemini returns 404, your region/API key is restricted. If Groq fails, the file is simply too massive for its context window.)*`;
+                aiResponse = `🚨 **Both AI Engines Failed to Respond.**\n\n**Gemini Error:** ${geminiError.message}\n**Groq Error:** ${groqErr.message}`;
             }
         }
 

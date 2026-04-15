@@ -18,22 +18,24 @@ app.use(express.json({ limit: '50mb' }));
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 
-if (!supabaseUrl || !supabaseKey) console.error("🚨 CRITICAL: Missing Supabase Keys!");
+if (!supabaseUrl || !supabaseKey) {
+    console.error("🛑 CRITICAL: Missing Supabase Keys in .env!");
+    process.exit(1);
+}
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-latest" });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// 🔥 UPGRADED: Nuclear System Prompt enforcing filenames
 const SYSTEM_PROMPT = `You are an elite, senior AI developer assistant. CRITICAL INSTRUCTION: Whenever you provide code, scripts, or data pipelines, YOU MUST ALWAYS wrap them entirely within standard Markdown code blocks. You MUST include a filename directly in the markdown tag. Format exactly like this: \`\`\`python filename="main.py"\n[code]\n\`\`\` NEVER output website artifacts like 'Open in Editor' or 'Click to Copy'. Speak strictly as an AI assistant providing clean, formatted markdown.`;
 
 app.post('/init', async (req, res) => {
     try {
         const { user_id, workspace_name, join_id } = req.body;
-        let currentWorkspace;
-
         if (!user_id) throw new Error("Missing user_id from frontend.");
+
+        let currentWorkspace;
 
         if (join_id) {
             const { data: joinedWs, error: joinErr } = await supabase.from('workspaces').select('*').eq('id', join_id).maybeSingle();
@@ -83,11 +85,15 @@ app.post('/branch', async (req, res) => {
         if (parent_message_id) {
             let ancestors = [];
             let currentId = parent_message_id;
-            while (currentId) {
+            
+            // Safety cap to prevent infinite loops in corrupted databases
+            let depthCap = 0;
+            while (currentId && depthCap < 1000) {
                 const { data: msg } = await supabase.from('messages').select('*').eq('id', currentId).single();
                 if (!msg) break;
                 ancestors.unshift(msg); 
                 currentId = msg.parent_message_id;
+                depthCap++;
             }
 
             let previousId = null;
@@ -100,7 +106,7 @@ app.post('/branch', async (req, res) => {
             }
 
             const { data: sysMsg, error: sysErr } = await supabase.from('messages').insert([{ 
-                branch_id: branch.id, sender_type: 'system', content: `🌱 Timeline diverged: #${branch.name}`, parent_message_id: previousId 
+                branch_id: branch.id, sender_type: 'system', content: `🚀 Timeline diverged: #${branch.name}`, parent_message_id: previousId 
             }]).select().single();
             if (sysErr) throw sysErr;
             if(sysMsg) systemMsgId = sysMsg.id;
@@ -157,7 +163,7 @@ app.post('/merge', async (req, res) => {
         }
 
         const { data: systemMsg, error: mrgErr } = await supabase.from('messages').insert([{ 
-            branch_id: target_branch_id, sender_type: 'system', content: `🚀 SQUASH & MERGE COMPLETE\n\n${mergeSummary}`, parent_message_id: actualTargetParentId 
+            branch_id: target_branch_id, sender_type: 'system', content: `🔀 SQUASH & MERGE COMPLETE\n\n${mergeSummary}`, parent_message_id: actualTargetParentId 
         }]).select().single();
         if (mrgErr) throw mrgErr;
         
@@ -240,7 +246,7 @@ app.post('/chat', async (req, res) => {
                 if (!aiResponse) throw new Error("Groq returned empty string.");
             } catch (groqErr) {
                 console.error("Groq Failure:", groqErr.message);
-                aiResponse = `🚨 **Both AI Engines Failed to Respond.**\n\n**Gemini Error:** ${geminiError.message}\n**Groq Error:** ${groqErr.message}`;
+                aiResponse = `❌ **Both AI Engines Failed to Respond.**\n\n**Gemini Error:** ${geminiError.message}\n**Groq Error:** ${groqErr.message}`;
             }
         }
 
@@ -249,6 +255,58 @@ app.post('/chat', async (req, res) => {
         }]).select().single();
 
         res.json({ success: true, userMessageId: userMessage.id, aiMessageId: aiMessage.id, aiResponse: aiMessage.content });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// 🔥 NEW: MULTIPLE FILE GITHUB PUSH ENDPOINT
+app.post('/github/push', async (req, res) => {
+    try {
+        const { repo, branch, files, message, token } = req.body;
+        if (!token || !repo || !files) throw new Error("Missing required GitHub parameters");
+
+        const headers = { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.v3+json' };
+        
+        // 1. Get current branch reference
+        const refRes = await fetch(`https://api.github.com/repos/${repo}/git/ref/heads/${branch}`, { headers });
+        if (!refRes.ok) throw new Error("Could not find repository or branch. Check token permissions.");
+        const refData = await refRes.json();
+        const baseTreeSha = refData.object.sha;
+
+        // 2. Create Blobs and Tree
+        const treeItems = [];
+        for (const file of files) {
+            treeItems.push({
+                path: file.path,
+                mode: '100644', // File mode
+                type: 'blob',
+                content: file.content
+            });
+        }
+
+        const treeRes = await fetch(`https://api.github.com/repos/${repo}/git/trees`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ base_tree: baseTreeSha, tree: treeItems })
+        });
+        const treeData = await treeRes.json();
+
+        // 3. Create Commit
+        const commitRes = await fetch(`https://api.github.com/repos/${repo}/git/commits`, {
+            method: 'POST', headers,
+            body: JSON.stringify({ message: message || "Update from DialogTree", tree: treeData.sha, parents: [baseTreeSha] })
+        });
+        const commitData = await commitRes.json();
+
+        // 4. Update Reference
+        const updateRes = await fetch(`https://api.github.com/repos/${repo}/git/refs/heads/${branch}`, {
+            method: 'PATCH', headers,
+            body: JSON.stringify({ sha: commitData.sha, force: true })
+        });
+        
+        if (!updateRes.ok) throw new Error("Failed to update branch reference.");
+
+        res.json({ success: true, commitSha: commitData.sha });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
@@ -314,11 +372,13 @@ app.get('/messages/:branch_id', async (req, res) => {
         let history = [];
         if (latestMsg) {
             let currentId = latestMsg.id;
-            while (currentId) {
+            let depthCap = 0;
+            while (currentId && depthCap < 1000) {
                 const { data: msg } = await supabase.from('messages').select('*').eq('id', currentId).single();
                 if (!msg) break;
                 history.unshift({ id: msg.id, role: msg.sender_type === 'ai' || msg.sender_type === 'system' ? (msg.sender_type === 'system' ? 'system' : 'ai') : 'user', content: msg.content, parent_message_id: msg.parent_message_id });
                 currentId = msg.parent_message_id;
+                depthCap++;
             }
         }
         res.json({ success: true, messages: history });
